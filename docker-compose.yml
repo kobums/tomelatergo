@@ -1,0 +1,10 @@
+version: '3'
+
+services:
+  backend:
+    restart: always
+    image: kobums/tomelater
+    ports:
+      - '9006:9006'
+    volumes:
+      - /home/tomelater/webdata:/usr/local/main/webdata
