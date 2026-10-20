@@ -2,7 +2,6 @@ package router
 
 import (
 	"crypto/rsa"
-	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"math/big"
@@ -119,7 +118,9 @@ var JwtAuthRequired = func(c *fiber.Ctx) error {
 		return c.Next()
 	}
 
-	if u.Path[:9] == "/api/user" {
+	// 인증 없이 허용하는 것은 회원가입(POST /api/user) 뿐이다.
+	// 이전에는 "/api/user" 로 시작하는 모든 경로(목록/조회/수정/삭제)가 인증 없이 열려 있었다.
+	if u.Path == "/api/user" && c.Method() == fiber.MethodPost {
 		return c.Next()
 	}
 
@@ -137,7 +138,7 @@ var JwtAuthRequired = func(c *fiber.Ctx) error {
 
 	log.Info().Msg("Jwt header is broken")
 
-	return nil
+	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"code": "error", "message": "unauthorized"})
 }
 
 func JwtAuth(c *fiber.Ctx, loginid string, passwd string) map[string]interface{} {
@@ -155,9 +156,6 @@ func JwtAuth(c *fiber.Ctx, loginid string, passwd string) map[string]interface{}
 
 	if loginType == "kakao" {
 		client := resty.New()
-		client.SetTLSClientConfig(&tls.Config{
-			InsecureSkipVerify: true, // Set to true to skip server verification (not recommended for production)
-		})
 
 		headers := map[string]string{
 			"Authorization": fmt.Sprintf("Bearer %v", loginToken),
@@ -199,9 +197,6 @@ func JwtAuth(c *fiber.Ctx, loginid string, passwd string) map[string]interface{}
 		}
 	} else if loginType == "naver" {
 		client := resty.New()
-		client.SetTLSClientConfig(&tls.Config{
-			InsecureSkipVerify: true, // Set to true to skip server verification (not recommended for production)
-		})
 
 		headers := map[string]string{
 			"Authorization": fmt.Sprintf("Bearer %v", loginToken),
@@ -243,9 +238,6 @@ func JwtAuth(c *fiber.Ctx, loginid string, passwd string) map[string]interface{}
 		}
 	} else if loginType == "google" {
 		client := resty.New()
-		client.SetTLSClientConfig(&tls.Config{
-			InsecureSkipVerify: true, // Set to true to skip server verification (not recommended for production)
-		})
 
 		url := fmt.Sprintf("https://oauth2.googleapis.com/tokeninfo?id_token=%v", loginToken)
 		resp, err := client.R().
@@ -506,9 +498,6 @@ func validateAppleToken(idToken string) (*AppleResponse, error) {
 
 func getApplePublicKey(kid string) (*rsa.PublicKey, error) {
 	client := resty.New()
-	client.SetTLSClientConfig(&tls.Config{
-		InsecureSkipVerify: true,
-	})
 
 	resp, err := client.R().
 		Get("https://appleid.apple.com/auth/keys")
