@@ -35,10 +35,33 @@ func getArrayCommai(name string) []int {
 
 func SetRouter(r *fiber.App) {
 
-    r.Get("/api/jwt", func(c *fiber.Ctx) error {
+	// Deprecated: 비밀번호가 URL 쿼리스트링에 실려 프록시·액세스 로그에 남는다.
+	// 새 클라이언트는 POST /api/auth/login 을 쓴다. 배포된 앱 호환용으로만 남겨 둔다
+	// (요청 로그에서는 제외: services/http.go 의 SkipURIs).
+	r.Get("/api/jwt", func(c *fiber.Ctx) error {
 		loginid := c.Query("loginid")
-        passwd := c.Query("passwd")
-        return c.JSON(JwtAuth(c, loginid, passwd))
+		passwd := c.Query("passwd")
+		return c.JSON(JwtAuth(c, c.Query("type"), c.Query("token"), loginid, passwd))
+	})
+
+	// 로그인: 자격 증명을 JSON 본문으로 받는다.
+	//   {"loginid": "...", "passwd": "..."}  또는  {"type": "apple|google|kakao|naver", "token": "..."}
+	r.Post("/api/auth/login", func(c *fiber.Ctx) error {
+		var body struct {
+			Loginid string `json:"loginid"`
+			Email   string `json:"email"`
+			Passwd  string `json:"passwd"`
+			Type    string `json:"type"`
+			Token   string `json:"token"`
+		}
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"code": "error", "message": "invalid body"})
+		}
+		loginid := body.Loginid
+		if loginid == "" {
+			loginid = body.Email
+		}
+		return c.JSON(JwtAuth(c, body.Type, body.Token, loginid, body.Passwd))
 	})
 
 	apiGroup := r.Group("/api")

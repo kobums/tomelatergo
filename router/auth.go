@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/url"
+	"os"
 	"strings"
 	"tomelater/global"
 	"tomelater/global/jwt"
@@ -114,7 +115,7 @@ var JwtAuthRequired = func(c *fiber.Ctx) error {
 	path := c.Path()
 	u, _ := url.Parse(path)
 
-	if u.Path == "/api/jwt" {
+	if u.Path == "/api/jwt" || u.Path == "/api/auth/login" {
 		return c.Next()
 	}
 
@@ -141,9 +142,7 @@ var JwtAuthRequired = func(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"code": "error", "message": "unauthorized"})
 }
 
-func JwtAuth(c *fiber.Ctx, loginid string, passwd string) map[string]interface{} {
-	loginType := c.Query("type")
-	loginToken := c.Query("token")
+func JwtAuth(c *fiber.Ctx, loginType string, loginToken string, loginid string, passwd string) map[string]interface{} {
 
 	conn := models.NewConnection()
 	defer conn.Close()
@@ -251,8 +250,24 @@ func JwtAuth(c *fiber.Ctx, loginid string, passwd string) map[string]interface{}
 				"message": "request api error",
 			}
 		}
+		if resp.StatusCode() != 200 {
+			return map[string]interface{}{
+				"code":    "error",
+				"message": "google token validation failed",
+			}
+		}
 		response := GoogleResponse{}
 		global.JsonDecode(resp.String(), &response)
+
+		// tokeninfo 는 서명·만료만 확인한다. 다른 앱용으로 발급된 ID 토큰을 그대로 들고 와도
+		// 로그인되지 않도록 aud(우리 OAuth 클라이언트 ID)와 iss 를 반드시 확인한다.
+		if err := checkGoogleClaims(response); err != nil {
+			log.Println(err)
+			return map[string]interface{}{
+				"code":    "error",
+				"message": "google token validation failed",
+			}
+		}
 
 		connectid := fmt.Sprintf("%v", response.Sub)
 		if connectid == "" {
@@ -419,12 +434,88 @@ func JwtAuth(c *fiber.Ctx, loginid string, passwd string) map[string]interface{}
 	}
 }
 
+// ---- OAuth audience (client ID) allow-lists ----
+//
+// APPLE_CLIENT_IDS / GOOGLE_CLIENT_IDS (쉼표 구분) 로 덮어쓸 수 있다.
+//   - Apple: 기본값은 tomelaterapp 의 iOS 번들 ID (ios/Runner.xcodeproj PRODUCT_BUNDLE_IDENTIFIER).
+//     웹(Sign in with Apple JS)용 Services ID 를 쓰면 여기에 추가해야 한다.
+//   - Google: 앱 저장소에 OAuth 클라이언트 ID 가 없어 기본값이 없다. 비어 있으면 Google 로그인을
+//     거부한다(aud 를 확인할 수 없으면 다른 앱용 토큰으로 로그인할 수 있으므로 fail-closed).
+
+const defaultAppleClientIDs = "com.tomelater.tomelater"
+
+var (
+	appleClientIDs  = envList("APPLE_CLIENT_IDS", defaultAppleClientIDs)
+	googleClientIDs = envList("GOOGLE_CLIENT_IDS", "")
+)
+
+func init() {
+	if len(googleClientIDs) == 0 {
+		log.Info().Msg("GOOGLE_CLIENT_IDS is not set: Google login is disabled until it is configured")
+	}
+}
+
+func envList(name string, def string) []string {
+	v, ok := os.LookupEnv(name)
+	if !ok {
+		v = def
+	}
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// audAllowed reports whether the aud claim (string or array) names one of allowed.
+func audAllowed(aud interface{}, allowed []string) bool {
+	var auds []string
+	switch v := aud.(type) {
+	case string:
+		auds = []string{v}
+	case []interface{}:
+		for _, a := range v {
+			if s, ok := a.(string); ok {
+				auds = append(auds, s)
+			}
+		}
+	case []string:
+		auds = v
+	}
+	for _, a := range auds {
+		for _, ok := range allowed {
+			if a == ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func checkGoogleClaims(r GoogleResponse) error {
+	if len(googleClientIDs) == 0 {
+		return fmt.Errorf("google login disabled: GOOGLE_CLIENT_IDS not set")
+	}
+	if r.Iss != "accounts.google.com" && r.Iss != "https://accounts.google.com" {
+		return fmt.Errorf("google token: unexpected iss %q", r.Iss)
+	}
+	if !audAllowed(r.Aud, googleClientIDs) {
+		return fmt.Errorf("google token: unexpected aud %q", r.Aud)
+	}
+	return nil
+}
 
 func validateAppleToken(idToken string) (*AppleResponse, error) {
 	claims := jwtgo.MapClaims{}
 
-	// 토큰을 파싱하되 audience 에러는 무시
+	// 서명(Apple 공개키)·만료·iss 는 파서가, aud 는 아래에서 허용 목록으로 직접 확인한다.
+	// 예전엔 audience 에러를 무시해서 다른 앱용으로 발급된 Apple 토큰으로도 로그인할 수 있었다.
 	token, err := jwtgo.ParseWithClaims(idToken, claims, func(token *jwtgo.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwtgo.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
 		kid, ok := token.Header["kid"].(string)
 		if !ok {
 			return nil, fmt.Errorf("kid header not found")
@@ -436,15 +527,16 @@ func validateAppleToken(idToken string) (*AppleResponse, error) {
 		}
 
 		return publicKey, nil
-	})
+	}, jwtgo.WithoutAudienceValidation(), jwtgo.WithIssuer("https://appleid.apple.com"))
 
-	// audience 관련 에러는 무시
-	if err != nil && !strings.Contains(err.Error(), "audience") {
+	if err != nil {
 		return nil, err
 	}
-
-	if token != nil && !token.Valid && err != nil && !strings.Contains(err.Error(), "audience") {
+	if token == nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token")
+	}
+	if !audAllowed(claims["aud"], appleClientIDs) {
+		return nil, fmt.Errorf("apple token: unexpected aud")
 	}
 
 	response := &AppleResponse{}
@@ -453,8 +545,8 @@ func validateAppleToken(idToken string) (*AppleResponse, error) {
 		response.Iss = iss.(string)
 	}
 
-	if aud, exists := claims["aud"]; exists {
-		response.Aud = aud.(string)
+	if aud, ok := claims["aud"].(string); ok {
+		response.Aud = aud
 	}
 
 	if sub, exists := claims["sub"]; exists {
