@@ -44,7 +44,9 @@ type KakaoResponse struct {
 }
 
 type NaverResponse struct {
-	Response struct {
+	Resultcode string `json:"resultcode"`
+	Message    string `json:"message"`
+	Response   struct {
 		ID           string `json:"id"`
 		Email        string `json:"email"`
 		Name         string `json:"name"`
@@ -154,6 +156,17 @@ func JwtAuth(c *fiber.Ctx, loginType string, loginToken string, loginid string, 
 	var item *models.User
 
 	if loginType == "kakao" {
+		// 토큰이 우리 앱(KAKAO_APP_ID)에 발급된 것인지 먼저 확인한다. 예전엔 /v2/user/me 만
+		// 호출해서, 다른 앱용으로 발급된 카카오 토큰으로도 같은 사용자로 로그인할 수 있었다.
+		tokenUserID, err := checkKakaoToken(loginToken)
+		if err != nil {
+			log.Println(err)
+			return map[string]interface{}{
+				"code":    "error",
+				"message": "kakao token validation failed",
+			}
+		}
+
 		client := resty.New()
 
 		headers := map[string]string{
@@ -174,11 +187,18 @@ func JwtAuth(c *fiber.Ctx, loginType string, loginToken string, loginid string, 
 				"message": "request api error",
 			}
 		}
+		if resp.StatusCode() != 200 {
+			return map[string]interface{}{
+				"code":    "error",
+				"message": "kakao token validation failed",
+			}
+		}
 		response := KakaoResponse{}
 		global.JsonDecode(resp.String(), &response)
 
+		// response.ID 가 0 이면 Sprintf 결과가 "0" 이라 빈 문자열 검사에 걸리지 않았다.
 		connectid := fmt.Sprintf("%v", response.ID)
-		if connectid == "" {
+		if response.ID == 0 || response.ID != tokenUserID {
 			log.Println(response)
 			return map[string]interface{}{
 				"code":    "error",
@@ -195,6 +215,15 @@ func JwtAuth(c *fiber.Ctx, loginType string, loginToken string, loginid string, 
 			}
 		}
 	} else if loginType == "naver" {
+		// 네이버는 토큰을 발급한 client_id 를 돌려주는 API 가 없다(checkNaverConfigured 주석 참고).
+		if err := checkNaverConfigured(); err != nil {
+			log.Println(err)
+			return map[string]interface{}{
+				"code":    "error",
+				"message": "naver token validation failed",
+			}
+		}
+
 		client := resty.New()
 
 		headers := map[string]string{
@@ -215,8 +244,20 @@ func JwtAuth(c *fiber.Ctx, loginType string, loginToken string, loginid string, 
 				"message": "request api error",
 			}
 		}
+		if resp.StatusCode() != 200 {
+			return map[string]interface{}{
+				"code":    "error",
+				"message": "naver token validation failed",
+			}
+		}
 		response := NaverResponse{}
 		global.JsonDecode(resp.String(), &response)
+		if response.Resultcode != "00" {
+			return map[string]interface{}{
+				"code":    "error",
+				"message": "naver token validation failed",
+			}
+		}
 
 		connectid := fmt.Sprintf("%v", response.Response.ID)
 		if connectid == "" {
@@ -447,12 +488,67 @@ const defaultAppleClientIDs = "com.tomelater.tomelater"
 var (
 	appleClientIDs  = envList("APPLE_CLIENT_IDS", defaultAppleClientIDs)
 	googleClientIDs = envList("GOOGLE_CLIENT_IDS", "")
+
+	// KAKAO_APP_ID: 카카오 디벨로퍼스의 앱 ID(숫자). NAVER_CLIENT_ID: 네이버 애플리케이션 Client ID.
+	// 현재 tomelaterapp·tomelaterfront 어느 쪽도 카카오/네이버 로그인을 쓰지 않으므로, 값이
+	// 없으면 해당 로그인을 거부한다(fail-closed). 클라이언트에 붙일 때 같이 설정할 것.
+	kakaoAppID    = strings.TrimSpace(os.Getenv("KAKAO_APP_ID"))
+	naverClientID = strings.TrimSpace(os.Getenv("NAVER_CLIENT_ID"))
 )
 
 func init() {
 	if len(googleClientIDs) == 0 {
 		log.Info().Msg("GOOGLE_CLIENT_IDS is not set: Google login is disabled until it is configured")
 	}
+	if kakaoAppID == "" {
+		log.Info().Msg("KAKAO_APP_ID is not set: Kakao login is disabled until it is configured")
+	}
+	if naverClientID == "" {
+		log.Info().Msg("NAVER_CLIENT_ID is not set: Naver login is disabled until it is configured")
+	}
+}
+
+type kakaoTokenInfo struct {
+	ID        int64 `json:"id"`
+	ExpiresIn int64 `json:"expires_in"`
+	AppID     int64 `json:"app_id"`
+}
+
+// checkKakaoToken 은 액세스 토큰이 우리 앱(KAKAO_APP_ID)에 발급된 것인지 확인하고, 토큰의
+// 사용자 ID 를 돌려준다. https://kapi.kakao.com/v1/user/access_token_info 의 app_id 비교.
+func checkKakaoToken(token string) (int64, error) {
+	if kakaoAppID == "" {
+		return 0, fmt.Errorf("kakao login disabled: KAKAO_APP_ID not set")
+	}
+	resp, err := resty.New().R().
+		SetHeader("Authorization", fmt.Sprintf("Bearer %v", token)).
+		Get("https://kapi.kakao.com/v1/user/access_token_info")
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode() != 200 {
+		return 0, fmt.Errorf("kakao token info: status %v", resp.StatusCode())
+	}
+	info := kakaoTokenInfo{}
+	global.JsonDecode(resp.String(), &info)
+	if info.ID == 0 || fmt.Sprintf("%v", info.AppID) != kakaoAppID {
+		return 0, fmt.Errorf("kakao token: unexpected app_id %v", info.AppID)
+	}
+	return info.ID, nil
+}
+
+// checkNaverConfigured 는 네이버 로그인 사용 여부를 NAVER_CLIENT_ID 설정으로 판단한다.
+//
+// 한계: 네이버는 카카오의 access_token_info 처럼 액세스 토큰을 발급한 client_id 를 알려 주는
+// API 가 없다. 그래서 서버는 프로필 API(/v1/nid/me)로 토큰이 유효한지만 확인할 수 있고,
+// 다른 앱용으로 발급된 네이버 토큰을 완전히 걸러내지는 못한다. 확실히 막으려면 클라이언트가
+// 액세스 토큰 대신 인가 코드를 보내고, 서버가 NAVER_CLIENT_ID/시크릿으로 직접 토큰을 교환해야
+// 한다(네이버 로그인을 클라이언트에 붙일 때 그 방식으로 구현할 것).
+func checkNaverConfigured() error {
+	if naverClientID == "" {
+		return fmt.Errorf("naver login disabled: NAVER_CLIENT_ID not set")
+	}
+	return nil
 }
 
 func envList(name string, def string) []string {
