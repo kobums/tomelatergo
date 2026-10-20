@@ -3,6 +3,7 @@ package jwt
 import (
 	"errors"
 	"os"
+	"strconv"
 	"time"
 	"tomelater/models"
 
@@ -17,6 +18,23 @@ type AuthTokenClaims struct {
 
 // JWT 서명 키는 환경변수 JWT_SECRET 으로 주입한다 (소스에 하드코딩 금지).
 var _secretCode string = os.Getenv("JWT_SECRET")
+
+// 토큰 유효기간(시간). 환경변수 JWT_TTL_HOURS 로 바꿀 수 있고 기본값은 720시간(30일)이다.
+// 예전엔 10년짜리 토큰을 발급해서 유출되면 사실상 영구히 쓸 수 있었다. 앱·웹 클라이언트는
+// 401 을 받으면 저장된 토큰을 지우고 로그인 화면으로 보낸다(만료 시 재로그인).
+const defaultTokenTTLHours = 720
+
+var tokenTTL = loadTokenTTL()
+
+func loadTokenTTL() time.Duration {
+	hours := defaultTokenTTLHours
+	if v := os.Getenv("JWT_TTL_HOURS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	return time.Duration(hours) * time.Hour
+}
 
 func init() {
 	if len(_secretCode) < 32 {
@@ -54,7 +72,7 @@ func MakeToken(item models.User) string {
 		User: item,
 		StandardClaims: jwt.StandardClaims{
 			IssuedAt:  jwt.At(now),
-			ExpiresAt: jwt.At(now.Add(time.Hour * 24 * 365 * 10)),
+			ExpiresAt: jwt.At(now.Add(tokenTTL)),
 		},
 	}
 
