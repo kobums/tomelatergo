@@ -46,6 +46,8 @@ func Http() {
 	if config.Log.Web {
 		app.Use(fiberzerolog.New(fiberzerolog.Config{
 			Logger: log.Get(),
+			// 구버전 GET /api/jwt 는 비밀번호가 쿼리스트링에 있으므로 요청 로그에서 뺀다.
+			SkipURIs: []string{"/api/jwt"},
 		}))
 	}
 

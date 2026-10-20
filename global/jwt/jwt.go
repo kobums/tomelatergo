@@ -2,6 +2,7 @@ package jwt
 
 import (
 	"errors"
+	"os"
 	"time"
 	"tomelater/models"
 
@@ -14,7 +15,14 @@ type AuthTokenClaims struct {
 	jwt.StandardClaims             // 표준 토큰 Claims
 }
 
-var _secretCode string = "WkaQHd100%"
+// JWT 서명 키는 환경변수 JWT_SECRET 으로 주입한다 (소스에 하드코딩 금지).
+var _secretCode string = os.Getenv("JWT_SECRET")
+
+func init() {
+	if len(_secretCode) < 32 {
+		panic("JWT_SECRET environment variable must be set (at least 32 characters)")
+	}
+}
 
 func Check(str string) (*AuthTokenClaims, error) {
 	if len(str) < 7 || str[:7] != "Bearer " {
